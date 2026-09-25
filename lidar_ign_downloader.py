@@ -4,9 +4,10 @@ import re
 import threading
 import urllib.request
 import urllib.error
+from urllib.parse import parse_qs, urlparse
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
-from qgis.PyQt.QtCore import Qt, QObject, QSettings, pyqtSignal
+from qgis.PyQt.QtCore import Qt, QDate, QObject, QSettings, pyqtSignal
 from qgis.PyQt.QtGui import QIcon, QColor
 from qgis.PyQt.QtWidgets import (
     QAction,
@@ -41,11 +42,13 @@ from qgis.core import (
     QgsGeometry,
     QgsCoordinateTransform,
     QgsRasterLayer,
+    QgsPointCloudLayer,
     QgsWkbTypes,
     QgsTask,
     QgsApplication,
     QgsRectangle,
     QgsPointXY,
+    NULL,
 )
 
 from qgis.gui import QgsMapToolEmitPoint, QgsRubberBand
@@ -216,6 +219,14 @@ class LidarIgnDownloaderDialog(QDialog):
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
+
+        self.load_index_button = QPushButton("Charger les dalles (métadonnées)")
+        self.load_index_button.setMinimumHeight(34)
+        self.load_index_button.setToolTip(
+            "Ajoute au projet la couche WFS IGN des dalles LiDAR HD "
+            "(seules les dalles visibles dans le canevas sont chargées)."
+        )
+        right_layout.addWidget(self.load_index_button)
 
         actions_group = QGroupBox("Actions")
         actions_layout = QVBoxLayout(actions_group)
@@ -467,21 +478,26 @@ class DownloadTask(QgsTask):
 class LidarIgnDownloaderPlugin:
     WFS_URL = "https://data.geopf.fr/wfs/ows"
 
+    # Index unique des dalles LiDAR HD : une entité par dalle, un champ URL par produit
+    WFS_TYPENAME = "IGNF_LIDAR-HD_METADONNEE:metadata"
+
     PRODUCTS = {
-        "MNT : Modèle Numérique de Terrain": "IGNF_MNT-LIDAR-HD:dalle",
-        "MNS : Modèle Numérique de Surface": "IGNF_MNS-LIDAR-HD:dalle",
-        "MNH : Modèle Numérique de Hauteur": "IGNF_MNH-LIDAR-HD:dalle",
-        "Nuage de points LIDAR classifié": "IGNF_NUAGES-DE-POINTS-LIDAR-HD:dalle",
+        "MNT : Modèle Numérique de Terrain": "url_mnt",
+        "MNS : Modèle Numérique de Surface": "url_mns",
+        "MNH : Modèle Numérique de Hauteur": "url_mnh",
+        "Nuage de points LIDAR classifié": "url_npl",
     }
 
+    TILE_NAME_FIELD = "coordonnees_nw"
+
     INFO_FIELD_CANDIDATES = [
-        "id_chantier",
-        "timestamp",
-        "projection",
-        "format",
-        "type_produit",
-        "zoom_start",
-        "zoom_stop",
+        "code_mission",
+        "date_debut_acquisition",
+        "date_fin_acquisition",
+        "date_edition",
+        "capteur",
+        "systeme_planimetrique",
+        "systeme_altimetrique",
     ]
 
     def __init__(self, iface):
@@ -529,6 +545,7 @@ class LidarIgnDownloaderPlugin:
         self.dlg.use_active_layer_button.clicked.connect(self.use_active_layer_extent)
         self.dlg.draw_rect_button.clicked.connect(self.start_rectangle_drawing)
         self.dlg.clear_extent_button.clicked.connect(self.clear_extent)
+        self.dlg.load_index_button.clicked.connect(self.load_index_layer)
         self.dlg.list_button.clicked.connect(self.list_tiles)
         self.dlg.download_button.clicked.connect(self.download_tiles)
         self.dlg.cancel_button.clicked.connect(self.cancel_download)
@@ -674,6 +691,26 @@ class LidarIgnDownloaderPlugin:
         )
         return QgsVectorLayer(uri, typename, "WFS")
 
+    def load_index_layer(self):
+        layer_name = "Dalles LiDAR HD (métadonnées IGN)"
+        if QgsProject.instance().mapLayersByName(layer_name):
+            self.dlg.add_log("La couche des dalles est déjà chargée dans le projet.")
+            return
+
+        layer = self.build_wfs_layer(self.WFS_TYPENAME)
+        if not layer.isValid():
+            self.dlg.add_log("Impossible de charger la couche des dalles.")
+            QMessageBox.critical(self.dlg, "Erreur WFS", "Impossible de charger la couche des dalles IGN.")
+            return
+
+        layer.setName(layer_name)
+        symbol = layer.renderer().symbol()
+        symbol.setColor(QColor(0, 0, 0, 0))
+        symbol.symbolLayer(0).setStrokeColor(QColor(230, 90, 20))
+        symbol.symbolLayer(0).setStrokeWidth(0.4)
+        QgsProject.instance().addMapLayer(layer)
+        self.dlg.add_log("Couche des dalles ajoutée (chargement limité à l'emprise affichée).")
+
     def transform_geometry(self, geom, src_crs, dest_crs):
         if src_crs == dest_crs:
             return QgsGeometry(geom)
@@ -689,7 +726,20 @@ class LidarIgnDownloaderPlugin:
         if idx < 0:
             return ""
         val = feat[idx]
-        return "" if val is None else str(val)
+        if val is None or val == NULL:
+            return ""
+        if isinstance(val, QDate):
+            return val.toString("yyyy-MM-dd")
+        return str(val)
+
+    @staticmethod
+    def file_name_from_url(url):
+        # Les URL WMS-R portent le nom de fichier dans le paramètre FILENAME
+        params = parse_qs(urlparse(url).query)
+        for key, values in params.items():
+            if key.upper() == "FILENAME" and values:
+                return values[0]
+        return os.path.basename(urlparse(url).path)
 
     def set_ui_busy(self, busy):
         for w in (
@@ -700,6 +750,7 @@ class LidarIgnDownloaderPlugin:
             self.dlg.selected_only_checkbox,
             self.dlg.draw_rect_button,
             self.dlg.clear_extent_button,
+            self.dlg.load_index_button,
             self.dlg.list_button,
             self.dlg.download_button,
             self.dlg.auto_load_checkbox,
@@ -746,7 +797,8 @@ class LidarIgnDownloaderPlugin:
             return
 
         product_label = self.dlg.product_combo.currentText()
-        typename = self.PRODUCTS[product_label]
+        url_field = self.PRODUCTS[product_label]
+        typename = self.WFS_TYPENAME
 
         self.dlg.add_log(f"Produit choisi : {product_label}")
         self.dlg.add_log("Chargement de l'index IGN...")
@@ -770,7 +822,7 @@ class LidarIgnDownloaderPlugin:
         emprise_wfs = self.transform_geometry(self.current_extent_geom, self.current_extent_crs, wfs_layer.crs())
 
         field_names = [f.name() for f in wfs_layer.fields()]
-        required_fields = ["name", "name_download", "url"]
+        required_fields = [self.TILE_NAME_FIELD, url_field]
         missing = [f for f in required_fields if f not in field_names]
         if missing:
             self.dlg.add_log("Champs manquants : " + ", ".join(missing))
@@ -790,7 +842,9 @@ class LidarIgnDownloaderPlugin:
         for feat in wfs_layer.getFeatures(req):
             geom = feat.geometry()
             if geom and not geom.isEmpty() and geom.intersects(emprise_wfs):
-                matched.append(feat)
+                # Dalle sans URL pour ce produit : donnée pas encore diffusée
+                if self.get_attr(feat, wfs_layer.fields(), url_field):
+                    matched.append(feat)
 
         self.dlg.add_log(f"Dalles intersectantes trouvées : {len(matched)}")
 
@@ -804,9 +858,9 @@ class LidarIgnDownloaderPlugin:
         fields = wfs_layer.fields()
 
         for row, feat in enumerate(matched):
-            tile_name = self.get_attr(feat, fields, "name") or f"feature_{row + 1}"
-            file_name = self.get_attr(feat, fields, "name_download")
-            download_url = self.get_attr(feat, fields, "url")
+            tile_name = self.get_attr(feat, fields, self.TILE_NAME_FIELD) or f"feature_{row + 1}"
+            download_url = self.get_attr(feat, fields, url_field)
+            file_name = self.file_name_from_url(download_url)
 
             infos = []
             for fname in self.INFO_FIELD_CANDIDATES:
@@ -829,16 +883,24 @@ class LidarIgnDownloaderPlugin:
 
         self.dlg.add_log("Liste prête.")
 
-    def load_raster_if_needed(self, file_path):
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext in [".tif", ".tiff"]:
-            rlayer = QgsRasterLayer(file_path, os.path.basename(file_path))
-            if rlayer.isValid():
-                QgsProject.instance().addMapLayer(rlayer)
-                if self.dlg is not None:
-                    self.dlg.add_log(f"Raster ajouté au canevas : {os.path.basename(file_path)}")
-            elif self.dlg is not None:
-                self.dlg.add_log(f"Raster invalide : {file_path}")
+    def load_file_if_needed(self, file_path):
+        name = os.path.basename(file_path)
+        lower = name.lower()
+        if lower.endswith((".tif", ".tiff")):
+            layer, kind = QgsRasterLayer(file_path, name), "Raster"
+        elif lower.endswith(".copc.laz"):
+            layer, kind = QgsPointCloudLayer(file_path, name, "copc"), "Nuage de points"
+        elif lower.endswith((".laz", ".las")):
+            layer, kind = QgsPointCloudLayer(file_path, name, "pdal"), "Nuage de points"
+        else:
+            return
+
+        if layer.isValid():
+            QgsProject.instance().addMapLayer(layer)
+            if self.dlg is not None:
+                self.dlg.add_log(f"{kind} ajouté au canevas : {name}")
+        elif self.dlg is not None:
+            self.dlg.add_log(f"{kind} invalide : {file_path}")
 
     def on_task_log(self, text):
         if self.dlg is not None:
@@ -858,9 +920,9 @@ class LidarIgnDownloaderPlugin:
         self.dlg.add_log(f"Terminé : {task.success_count} succès, {task.error_count} erreur(s).")
 
         if self.dlg.auto_load_checkbox.isChecked():
-            self.dlg.add_log("Chargement des rasters téléchargés dans QGIS...")
+            self.dlg.add_log("Chargement des données téléchargées dans QGIS...")
             for file_path in task.downloaded_files:
-                self.load_raster_if_needed(file_path)
+                self.load_file_if_needed(file_path)
         else:
             self.dlg.add_log("Chargement automatique non activé.")
 
