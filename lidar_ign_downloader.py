@@ -370,8 +370,10 @@ class DownloadTask(QgsTask):
         return re.sub(r'[<>:"/\\|?*]+', "_", name)
 
     MAX_ATTEMPTS = 3
-    # Codes renvoyés de façon intermittente par la Géoplateforme (dont 400 LayerNotDefined)
-    RETRYABLE_HTTP_CODES = (400, 429, 500, 502, 503, 504)
+    # Codes HTTP transitoires, retentés quelle que soit l'URL
+    RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
+    # Le WMS-R de la Géoplateforme renvoie par intermittence un 400 « LayerNotDefined »
+    WMS_R_MARKER = "/wms-r"
 
     def _remove_quietly(self, path):
         try:
@@ -410,7 +412,8 @@ class DownloadTask(QgsTask):
             return ("ok", None)
 
         except urllib.error.HTTPError as e:
-            status = "retry" if e.code in self.RETRYABLE_HTTP_CODES else "error"
+            retryable = e.code in self.RETRYABLE_HTTP_CODES or (e.code == 400 and self.WMS_R_MARKER in url)
+            status = "retry" if retryable else "error"
             return (status, f"HTTP {e.code} : {e.reason}")
         except urllib.error.URLError as e:
             return ("retry", f"URL : {e}")
@@ -778,9 +781,18 @@ class LidarIgnDownloaderPlugin:
         layer.setLabeling(QgsVectorLayerSimpleLabeling(label_settings))
         layer.setLabelsEnabled(True)
 
-    def replace_layer(self, layer):
+    TILE_LAYER_PROPERTY = "lidar_ign_downloader/tile_layer"
+
+    def replace_layer(self, layer, kind):
+        """Ajoute la couche de dalles en remplaçant seulement celle du même type
+        créée précédemment par le plugin, jamais une couche de l'utilisateur."""
         project = QgsProject.instance()
-        project.removeMapLayers([l.id() for l in project.mapLayersByName(layer.name())])
+        previous = [
+            l.id() for l in project.mapLayers().values()
+            if l.customProperty(self.TILE_LAYER_PROPERTY) == kind
+        ]
+        project.removeMapLayers(previous)
+        layer.setCustomProperty(self.TILE_LAYER_PROPERTY, kind)
         project.addMapLayer(layer)
 
     def show_lidar_tiles(self):
@@ -792,11 +804,18 @@ class LidarIgnDownloaderPlugin:
 
         layer.setName("Dalles LiDAR HD")
         self.style_tile_layer(layer, QColor(230, 90, 20), self.TILE_NAME_FIELD)
-        self.replace_layer(layer)
+        self.replace_layer(layer, "lidar")
         self.dlg.add_log("Couche WFS des dalles LiDAR HD ajoutée (toutes les dalles diffusées par l'IGN).")
 
     def show_rgealti_tiles(self):
-        import processing
+        try:
+            import processing
+        except ImportError:
+            self.show_grid_error(
+                "L'extension « Processing » (Traitements) est nécessaire pour générer la grille.\n\n"
+                "Activez-la dans Extensions → Installer/Gérer les extensions → Installées."
+            )
+            return
 
         self.dlg.add_log("Génération de la grille RGE ALTI sur toute la métropole...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -813,25 +832,33 @@ class LidarIgnDownloaderPlugin:
                 "OUTPUT": "TEMPORARY_OUTPUT",
             })["OUTPUT"]
             # Même identifiant que le LiDAR HD : coin nord-ouest en km
-            size_km = self.TILE_SIZE_M
+            size_m = self.TILE_SIZE_M
             layer = processing.run("native:fieldcalculator", {
                 "INPUT": grid,
                 "FIELD_NAME": "id_dalle",
                 "FIELD_TYPE": 2,  # texte
                 "FIELD_LENGTH": 9,
                 "FORMULA": (
-                    f"lpad(to_string(round(\"left\" / {size_km})), 4, '0') || '-' || "
-                    f"lpad(to_string(round(\"top\" / {size_km})), 4, '0')"
+                    f"lpad(to_string(round(\"left\" / {size_m})), 4, '0') || '-' || "
+                    f"lpad(to_string(round(\"top\" / {size_m})), 4, '0')"
                 ),
                 "OUTPUT": "TEMPORARY_OUTPUT",
             })["OUTPUT"]
+        except Exception as e:
+            # Algorithme introuvable, mémoire insuffisante...
+            self.show_grid_error(f"La génération de la grille a échoué.\n\nDétail : {e}")
+            return
         finally:
             QApplication.restoreOverrideCursor()
 
         layer.setName("Dalles RGE ALTI 1 m")
         self.style_tile_layer(layer, QColor(30, 110, 200), "id_dalle")
-        self.replace_layer(layer)
+        self.replace_layer(layer, "rgealti")
         self.dlg.add_log(f"Grille RGE ALTI ajoutée : {layer.featureCount()} dalle(s) de 1 km sur la métropole.")
+
+    def show_grid_error(self, message):
+        self.dlg.add_log("Grille RGE ALTI non générée : " + message.splitlines()[0])
+        QMessageBox.critical(self.dlg, "Grille RGE ALTI", message)
 
     def transform_geometry(self, geom, src_crs, dest_crs):
         if src_crs == dest_crs:
