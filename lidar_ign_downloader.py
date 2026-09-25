@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
+import http.client
 import math
 import os
 import re
+import socket
 import threading
 import time
 import urllib.request
@@ -166,12 +168,7 @@ class LidarIgnDownloaderDialog(QDialog):
         params_form = QFormLayout(params_group)
 
         self.product_combo = QComboBox()
-        self.product_combo.addItems([
-            "MNT : Modèle Numérique de Terrain",
-            "MNS : Modèle Numérique de Surface",
-            "MNH : Modèle Numérique de Hauteur",
-            "Nuage de points LIDAR classifié",
-        ])
+        self.product_combo.addItems(list(LidarIgnDownloaderPlugin.PRODUCTS))
         self.product_combo.insertSeparator(self.product_combo.count())
         self.product_combo.addItem(LidarIgnDownloaderPlugin.RGEALTI_LABEL)
         params_form.addRow("Produit", self.product_combo)
@@ -287,6 +284,12 @@ class LidarIgnDownloaderDialog(QDialog):
         self.reset_table_layout()
         root.addWidget(self.table)
 
+        self.clear_table_button = QPushButton("Vider la liste")
+        clear_row = QHBoxLayout()
+        clear_row.addStretch()
+        clear_row.addWidget(self.clear_table_button)
+        root.addLayout(clear_row)
+
         root.addWidget(QLabel("Progression globale"))
         self.progress_global = QProgressBar()
         self.progress_global.setRange(0, 100)
@@ -388,6 +391,8 @@ class DownloadTask(QgsTask):
                     detail = response.read(500).decode("utf-8", "replace")
                     return ("retry", f"réponse non binaire du serveur : {detail[:200]}")
 
+                expected = response.headers.get("Content-Length")
+                received = 0
                 chunk_size = 4 * 1024 * 1024
                 with open(tmp_path, "wb") as f:
                     while True:
@@ -397,6 +402,11 @@ class DownloadTask(QgsTask):
                         if not chunk:
                             break
                         f.write(chunk)
+                        received += len(chunk)
+
+            # Une connexion coupée en plein transfert se termine sans erreur : on vérifie la taille
+            if expected and expected.isdigit() and received != int(expected):
+                return ("retry", f"transfert incomplet : {received} octets reçus sur {expected}")
             return ("ok", None)
 
         except urllib.error.HTTPError as e:
@@ -404,8 +414,11 @@ class DownloadTask(QgsTask):
             return (status, f"HTTP {e.code} : {e.reason}")
         except urllib.error.URLError as e:
             return ("retry", f"URL : {e}")
-        except TimeoutError as e:
+        except (TimeoutError, socket.timeout) as e:
             return ("retry", f"délai dépassé : {e}")
+        except (ConnectionError, http.client.HTTPException) as e:
+            # Connexion coupée par le serveur, y compris en plein transfert
+            return ("retry", f"connexion interrompue : {e!r}")
         except Exception as e:
             return ("error", str(e))
 
@@ -522,9 +535,9 @@ class LidarIgnDownloaderPlugin:
     WFS_TYPENAME = "IGNF_LIDAR-HD_METADONNEE:metadata"
 
     PRODUCTS = {
-        "MNT : Modèle Numérique de Terrain": "url_mnt",
-        "MNS : Modèle Numérique de Surface": "url_mns",
-        "MNH : Modèle Numérique de Hauteur": "url_mnh",
+        "MNT : Modèle Numérique de Terrain (50 cm)": "url_mnt",
+        "MNS : Modèle Numérique de Surface (50 cm)": "url_mns",
+        "MNH : Modèle Numérique de Hauteur (50 cm)": "url_mnh",
         "Nuage de points LIDAR classifié": "url_npl",
     }
 
@@ -539,9 +552,6 @@ class LidarIgnDownloaderPlugin:
     # Rectangle englobant la métropole et la Corse en Lambert 93 (xmin, ymin, xmax, ymax)
     RGEALTI_FXX_EXTENT = (98000, 6045000, 1243000, 7111000)
     RGEALTI_RESOLUTION_M = 1
-
-    # Produit LiDAR pouvant être complété par le RGE ALTI là où il manque
-    LIDAR_MNT_FIELD = "url_mnt"
 
     INFO_FIELD_CANDIDATES = [
         "code_mission",
@@ -603,6 +613,7 @@ class LidarIgnDownloaderPlugin:
         self.dlg.list_button.clicked.connect(self.list_tiles)
         self.dlg.download_button.clicked.connect(self.download_tiles)
         self.dlg.cancel_button.clicked.connect(self.cancel_download)
+        self.dlg.clear_table_button.clicked.connect(self.clear_tiles)
 
         self.dlg.exec()
 
@@ -865,6 +876,7 @@ class LidarIgnDownloaderPlugin:
             self.dlg.show_rgealti_tiles_button,
             self.dlg.list_button,
             self.dlg.download_button,
+            self.dlg.clear_table_button,
             self.dlg.auto_load_checkbox,
             self.dlg.workers_spinbox,
         ):
@@ -900,16 +912,25 @@ class LidarIgnDownloaderPlugin:
 
     def grid_tile_ids(self, emprise_l93):
         """Identifiants 'XXXX-YYYY' (coin nord-ouest en km, comme le LiDAR HD)
-        des dalles de 1 km dont la surface recoupe l'emprise."""
+        des dalles de 1 km recoupées par l'emprise (polygone, ligne ou point)."""
         size = self.TILE_SIZE_M
         bbox = emprise_l93.boundingBox()
+
+        engine = QgsGeometry.createGeometryEngine(emprise_l93.constGet())
+        engine.prepareGeometry()
+        # Pour un polygone, on ignore les dalles voisines qui ne font que toucher
+        # son contour ; un point ou une ligne peut, lui, être posé sur un bord de dalle
+        is_polygon = emprise_l93.type() == QgsWkbTypes.PolygonGeometry
+
         ids = []
-        for x in range(math.floor(bbox.xMinimum() / size), math.ceil(bbox.xMaximum() / size)):
-            for y in range(math.floor(bbox.yMinimum() / size), math.ceil(bbox.yMaximum() / size)):
+        for x in range(math.floor(bbox.xMinimum() / size), math.floor(bbox.xMaximum() / size) + 1):
+            for y in range(math.floor(bbox.yMinimum() / size), math.floor(bbox.yMaximum() / size) + 1):
                 tile = QgsGeometry.fromRect(QgsRectangle(x * size, y * size, (x + 1) * size, (y + 1) * size))
-                inter = tile.intersection(emprise_l93)
-                if not inter.isEmpty() and inter.area() > 0:
-                    ids.append(f"{x:04d}-{y + 1:04d}")
+                if not engine.intersects(tile.constGet()):
+                    continue
+                if is_polygon and engine.touches(tile.constGet()):
+                    continue
+                ids.append(f"{x:04d}-{y + 1:04d}")
         return ids
 
     def rgealti_row(self, tile_id):
@@ -1003,6 +1024,12 @@ class LidarIgnDownloaderPlugin:
             self.dlg.table.setItem(row, 3, QTableWidgetItem(download_url))
             self.dlg.table.setItem(row, 4, QTableWidgetItem(info_text))
 
+    def clear_tiles(self):
+        self.dlg.table.setRowCount(0)
+        self.dlg.reset_table_layout()
+        self.dlg.progress_global.setValue(0)
+        self.dlg.add_log("Liste des dalles vidée.")
+
     def list_tiles(self):
         self.dlg.table.setRowCount(0)
         self.dlg.reset_table_layout()
@@ -1019,43 +1046,14 @@ class LidarIgnDownloaderPlugin:
         emprise_l93 = self.transform_geometry(
             self.current_extent_geom, self.current_extent_crs, QgsCoordinateReferenceSystem(self.RGEALTI_CRS)
         )
-        grid_ids = self.grid_tile_ids(emprise_l93)
 
         if product_label == self.RGEALTI_LABEL:
-            rows = [self.rgealti_row(tile_id) for tile_id in grid_ids]
+            rows = [self.rgealti_row(tile_id) for tile_id in self.grid_tile_ids(emprise_l93)]
             self.dlg.add_log(f"Dalles RGE ALTI de 1 km sur l'emprise : {len(rows)}")
         else:
-            url_field = self.PRODUCTS[product_label]
-            rows = self.lidar_rows(product_label, url_field, emprise_l93)
+            rows = self.lidar_rows(product_label, self.PRODUCTS[product_label], emprise_l93)
             if rows is None:
                 return
-
-            found = {r[0] for r in rows}
-            uncovered = [tile_id for tile_id in grid_ids if tile_id not in found]
-            if uncovered:
-                self.dlg.add_log(
-                    f"{len(uncovered)} dalle(s) de l'emprise sur {len(grid_ids)} "
-                    "sans donnée LiDAR HD diffusée pour ce produit."
-                )
-                if url_field == self.LIDAR_MNT_FIELD:
-                    reply = QMessageBox.question(
-                        self.dlg,
-                        "Couverture LiDAR incomplète",
-                        f"{len(uncovered)} dalle(s) sur {len(grid_ids)} n'ont pas encore de MNT LiDAR HD.\n\n"
-                        "Les compléter avec le MNT RGE ALTI 1 m ?",
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.Yes,
-                    )
-                    if reply == QMessageBox.Yes:
-                        rows += [self.rgealti_row(tile_id) for tile_id in uncovered]
-                        self.dlg.add_log(f"{len(uncovered)} dalle(s) complétée(s) par le RGE ALTI 1 m.")
-                elif rows:
-                    QMessageBox.information(
-                        self.dlg,
-                        "Couverture LiDAR incomplète",
-                        f"{len(uncovered)} dalle(s) sur {len(grid_ids)} de l'emprise n'ont pas encore "
-                        f"de donnée '{product_label}'.\n\nSeules les dalles disponibles sont listées."
-                    )
 
         if not rows:
             self.show_no_data_message(product_label)

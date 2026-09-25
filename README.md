@@ -11,7 +11,6 @@ Plugin QGIS pour télécharger les dalles LiDAR HD IGN et produits dérivés dep
 - Listage des dalles LiDAR HD disponibles via le service WFS IGN (couche `IGNF_LIDAR-HD_METADONNEE:metadata`)
 - Affichage de la couche des dalles LiDAR HD dans le projet (bouton « Charger les dalles »)
 - MNT RGE ALTI 1 m en dalles de 1 km (France métropolitaine), extraites du service WMS-R IGN
-- Complément automatique du MNT LiDAR HD par le RGE ALTI 1 m sur les dalles pas encore diffusées
 - Téléchargement en parallèle avec barre de progression et nouvelles tentatives en cas d'erreur du serveur
 - Chargement automatique des rasters et nuages de points dans QGIS après téléchargement
 
